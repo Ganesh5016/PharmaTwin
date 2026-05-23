@@ -80,26 +80,55 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> User:
     token = credentials.credentials
+    db = get_db()
+
+    # Strategy 1: Try decoding as our own JWT first
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
         user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        if user_id:
+            try:
+                doc = await db.users.find_one({"_id": ObjectId(user_id)})
+                if doc and doc.get("is_active", True):
+                    return User(doc)
+            except Exception:
+                pass  # Fall through to Firebase verification
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        pass  # Fall through to Firebase verification
 
-    db = get_db()
+    # Strategy 2: Try verifying as a raw Firebase ID token
     try:
-        doc = await db.users.find_one({"_id": ObjectId(user_id)})
-    except Exception:
-        raise HTTPException(status_code=401, detail="Please log out and log in again.")
+        decoded = verify_firebase_token(token)
+        firebase_uid = decoded["uid"]
+        email = decoded.get("email", "")
+        name = decoded.get("name", email.split("@")[0] if email else "User")
 
-    if not doc or not doc.get("is_active", True):
-        raise HTTPException(status_code=401, detail="User not found or inactive")
+        # Find or create user
+        user_doc = await db.users.find_one({"firebase_uid": firebase_uid})
+        if not user_doc:
+            new_user = {
+                "firebase_uid": firebase_uid,
+                "email": email,
+                "name": name,
+                "role": UserRole.RESEARCHER,
+                "is_active": True,
+                "created_at": datetime.utcnow(),
+                "last_login": datetime.utcnow(),
+            }
+            result = await db.users.insert_one(new_user)
+            new_user["_id"] = result.inserted_id
+            user_doc = new_user
+        else:
+            await db.users.update_one(
+                {"_id": user_doc["_id"]},
+                {"$set": {"last_login": datetime.utcnow()}}
+            )
 
-    return User(doc)
+        return User(user_doc)
+    except Exception as e:
+        logger.warning(f"Firebase token verification also failed: {e}")
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:
