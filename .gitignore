@@ -1,0 +1,33 @@
+# Flutter/Dart/Pub
+.dart_tool/
+.packages
+build/
+*.log
+*.sqlite
+flutter_sdk/
+
+# Android
+**/android/.gradle/
+**/android/app/build/
+**/android/local.properties
+
+# iOS
+**/ios/Pods/
+**/ios/.symlinks/
+**/ios/Flutter/Flutter.podspec
+
+# Python/Backend
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Secrets
+firebase-credentials.json
+google-services.json

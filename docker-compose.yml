@@ -1,0 +1,95 @@
+version: '3.9'
+
+services:
+  # ── PostgreSQL Database ──────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: pharmatwin_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: pharmatwin
+      POSTGRES_PASSWORD: pharmatwin123
+      POSTGRES_DB: pharmatwin_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pharmatwin -d pharmatwin_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis Cache ──────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: pharmatwin_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── FastAPI Backend ──────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pharmatwin_backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pharmatwin:pharmatwin123@postgres:5432/pharmatwin_db
+      REDIS_URL: redis://redis:6379
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production-use-strong-random-key}
+      FIREBASE_CREDENTIALS_PATH: /app/firebase-credentials.json
+      DEBUG: "false"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/firebase-credentials.json:/app/firebase-credentials.json
+      - ml_models:/app/ml/saved_models
+      - uploads:/app/uploads
+      - reports:/app/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── pgAdmin (optional, dev only) ─────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pharmatwin_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@pharmatwin.ai
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    profiles:
+      - dev
+
+volumes:
+  postgres_data:
+  redis_data:
+  ml_models:
+  uploads:
+  reports:
+
+networks:
+  default:
+    name: pharmatwin_network
