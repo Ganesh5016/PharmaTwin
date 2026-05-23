@@ -1,10 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
 from typing import Optional
+from bson import ObjectId
 import jwt
 import logging
 
@@ -51,11 +50,8 @@ class UserResponse(BaseModel):
     name: str
     role: str
     is_active: bool
-    created_at: datetime
+    created_at: Optional[datetime] = None
     organization: Optional[str] = None
-
-    class Config:
-        from_attributes = True
 
 
 # ─── JWT helpers ────────────────────────────────────────────────────────────
@@ -82,7 +78,6 @@ def create_refresh_token(user_id: str) -> str:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_db),
 ) -> User:
     token = credentials.credentials
     try:
@@ -95,12 +90,12 @@ async def get_current_user(
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user or not user.is_active:
+    db = get_db()
+    doc = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not doc or not doc.get("is_active", True):
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
-    return user
+    return User(doc)
 
 
 async def require_admin(current_user: User = Depends(get_current_user)) -> User:
@@ -112,7 +107,7 @@ async def require_admin(current_user: User = Depends(get_current_user)) -> User:
 # ─── Endpoints ──────────────────────────────────────────────────────────────
 
 @router.post("/login", response_model=TokenResponse)
-async def login(request: FirebaseLoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(request: FirebaseLoginRequest):
     """Exchange Firebase ID token for JWT."""
     try:
         decoded = verify_firebase_token(request.id_token)
@@ -121,23 +116,30 @@ async def login(request: FirebaseLoginRequest, db: AsyncSession = Depends(get_db
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
 
-    # Find or create user
-    result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
-    user = result.scalar_one_or_none()
+    db = get_db()
+    user_doc = await db.users.find_one({"firebase_uid": firebase_uid})
 
-    if not user:
+    if not user_doc:
         # Auto-create user from Firebase data
-        user = User(
-            firebase_uid=firebase_uid,
-            email=email,
-            name=decoded.get("name", email.split("@")[0]),
-            role=UserRole.RESEARCHER,
+        new_user = {
+            "firebase_uid": firebase_uid,
+            "email": email,
+            "name": decoded.get("name", email.split("@")[0]),
+            "role": UserRole.RESEARCHER,
+            "is_active": True,
+            "created_at": datetime.utcnow(),
+            "last_login": datetime.utcnow(),
+        }
+        result = await db.users.insert_one(new_user)
+        new_user["_id"] = result.inserted_id
+        user_doc = new_user
+    else:
+        await db.users.update_one(
+            {"_id": user_doc["_id"]},
+            {"$set": {"last_login": datetime.utcnow()}}
         )
-        db.add(user)
-        await db.flush()
 
-    user.last_login = datetime.utcnow()
-
+    user = User(user_doc)
     access_token = create_access_token(str(user.id), user.email, user.role)
     refresh_token = create_refresh_token(str(user.id))
 
@@ -151,16 +153,16 @@ async def login(request: FirebaseLoginRequest, db: AsyncSession = Depends(get_db
 
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
-async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db)):
+async def register(request: RegisterRequest):
     """Register a new user."""
     try:
         decoded = verify_firebase_token(request.id_token)
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Firebase token: {e}")
 
-    # Check existing
-    result = await db.execute(select(User).where(User.email == request.email))
-    if result.scalar_one_or_none():
+    db = get_db()
+    existing = await db.users.find_one({"email": request.email})
+    if existing:
         raise HTTPException(status_code=409, detail="User already exists")
 
     role_map = {
@@ -169,20 +171,21 @@ async def register(request: RegisterRequest, db: AsyncSession = Depends(get_db))
         "user": UserRole.USER,
     }
 
-    user = User(
-        firebase_uid=request.firebase_uid,
-        email=request.email,
-        name=request.name,
-        role=role_map.get(request.role.lower(), UserRole.RESEARCHER),
-    )
-    db.add(user)
-    await db.flush()
+    new_user = {
+        "firebase_uid": request.firebase_uid,
+        "email": request.email,
+        "name": request.name,
+        "role": role_map.get(request.role.lower(), UserRole.RESEARCHER),
+        "is_active": True,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.users.insert_one(new_user)
 
-    return {"message": "User registered successfully", "user_id": str(user.id)}
+    return {"message": "User registered successfully", "user_id": str(result.inserted_id)}
 
 
 @router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_db)):
+async def refresh_token(request: RefreshRequest):
     """Refresh access token."""
     try:
         payload = jwt.decode(
@@ -198,11 +201,12 @@ async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if not user:
+    db = get_db()
+    doc = await db.users.find_one({"_id": ObjectId(user_id)})
+    if not doc:
         raise HTTPException(status_code=401, detail="User not found")
 
+    user = User(doc)
     access_token = create_access_token(str(user.id), user.email, user.role)
     new_refresh_token = create_refresh_token(str(user.id))
 
@@ -218,7 +222,15 @@ async def refresh_token(request: RefreshRequest, db: AsyncSession = Depends(get_
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     """Get current user profile."""
-    return current_user
+    return UserResponse(
+        id=current_user.id,
+        email=current_user.email,
+        name=current_user.name,
+        role=current_user.role,
+        is_active=current_user.is_active,
+        created_at=current_user.created_at,
+        organization=current_user.organization,
+    )
 
 
 @router.post("/forgot-password")

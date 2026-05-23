@@ -1,11 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from contextlib import asynccontextmanager
 import logging
 
 from app.core.config import settings
-from app.core.database import engine, Base
+from app.core.database import connect_db, close_db
 from app.api.v1.router import api_router
 from app.core.firebase import initialize_firebase
 
@@ -17,20 +16,20 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("🚀 PharmaTwin AI Backend starting up...")
-    
+
     # Initialize Firebase Admin
     initialize_firebase()
-    
-    # Create database tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    
-    logger.info("✅ Database tables initialized")
+
+    # Connect to MongoDB
+    await connect_db()
+
+    logger.info("✅ MongoDB connected")
     logger.info("✅ Firebase Admin SDK initialized")
     logger.info("🧬 PharmaTwin AI is ready!")
-    
+
     yield
-    
+
+    await close_db()
     logger.info("🛑 PharmaTwin AI shutting down...")
 
 
@@ -71,5 +70,5 @@ async def health_check():
     return {
         "status": "healthy",
         "ai_models": "loaded",
-        "database": "connected",
+        "database": "mongodb",
     }

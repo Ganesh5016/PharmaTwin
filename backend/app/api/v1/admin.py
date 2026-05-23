@@ -1,26 +1,26 @@
-"""Admin API"""
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+"""Admin API - MongoDB version"""
+from fastapi import APIRouter, Depends
+from bson import ObjectId
 from app.core.database import get_db
 from app.api.v1.auth import get_current_user, require_admin
-from app.models.models import User, Batch, Prediction
+from app.models.models import User
 
 router = APIRouter()
 
+
 @router.get("/stats")
 async def get_admin_stats(
-    db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    user_count = await db.scalar(select(func.count(User.id)))
-    batch_count = await db.scalar(select(func.count(Batch.id)))
-    pred_count = await db.scalar(select(func.count(Prediction.id)))
-    
+    db = get_db()
+    user_count = await db.users.count_documents({})
+    batch_count = await db.batches.count_documents({})
+    pred_count = await db.predictions.count_documents({})
+
     return {
-        "total_users": user_count or 0,
-        "total_batches": batch_count or 0,
-        "total_predictions": pred_count or 0,
+        "total_users": user_count,
+        "total_batches": batch_count,
+        "total_predictions": pred_count,
         "ai_models_status": {
             "lstm": "active",
             "xgboost": "active",
@@ -31,24 +31,25 @@ async def get_admin_stats(
         "system_health": "optimal",
     }
 
+
 @router.get("/users")
 async def list_users(
-    db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
-    result = await db.execute(select(User).limit(50))
-    users = result.scalars().all()
+    db = get_db()
+    users = await db.users.find().limit(50).to_list(50)
     return [
         {
-            "id": str(u.id),
-            "email": u.email,
-            "name": u.name,
-            "role": u.role,
-            "is_active": u.is_active,
-            "created_at": str(u.created_at),
+            "id": str(u["_id"]),
+            "email": u.get("email", ""),
+            "name": u.get("name", ""),
+            "role": u.get("role", "user"),
+            "is_active": u.get("is_active", True),
+            "created_at": str(u.get("created_at", "")),
         }
         for u in users
     ]
+
 
 @router.post("/ai/retrain")
 async def trigger_retrain(
@@ -61,6 +62,7 @@ async def trigger_retrain(
         "message": f"Retraining job queued for model: {model_name}",
         "estimated_time_minutes": 15,
     }
+
 
 @router.get("/ai/metrics")
 async def get_model_metrics(admin: User = Depends(require_admin)):

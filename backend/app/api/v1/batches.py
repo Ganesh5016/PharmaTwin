@@ -1,13 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, or_
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+from bson import ObjectId
 import uuid
 
 from app.core.database import get_db
-from app.models.models import Batch, BatchStatus, User
+from app.models.models import User, BatchStatus
 from app.api.v1.auth import get_current_user
 
 router = APIRouter()
@@ -43,9 +42,6 @@ class BatchResponse(BaseModel):
     notes: Optional[str]
     created_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 def _generate_batch_id() -> str:
     now = datetime.utcnow()
@@ -53,30 +49,50 @@ def _generate_batch_id() -> str:
     return f"PT-{now.year}-{now.strftime('%m%d')}-{suffix}"
 
 
+def _to_response(b: dict) -> BatchResponse:
+    return BatchResponse(
+        id=str(b["_id"]),
+        batch_id=b.get("batch_id", ""),
+        drug_name=b.get("drug_name", ""),
+        dosage_form=b.get("dosage_form", ""),
+        strength_mg=b.get("strength_mg", 0),
+        drug_load_percent=b.get("drug_load_percent", 0),
+        batch_size_kg=b.get("batch_size_kg", 0),
+        packaging_type=b.get("packaging_type"),
+        manufacturer=b.get("manufacturer"),
+        status=b.get("status", "pending"),
+        stability_score=b.get("stability_score"),
+        degradation_risk=b.get("degradation_risk"),
+        predicted_shelf_life_months=b.get("predicted_shelf_life_months"),
+        notes=b.get("notes"),
+        created_at=b.get("created_at", datetime.utcnow()),
+    )
+
+
 @router.post("/", response_model=BatchResponse, status_code=201)
 async def create_batch(
     request: BatchCreateRequest,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    batch = Batch(
-        batch_id=_generate_batch_id(),
-        owner_id=current_user.id,
-        drug_name=request.drug_name,
-        dosage_form=request.dosage_form,
-        strength_mg=request.strength_mg,
-        drug_load_percent=request.drug_load_percent,
-        batch_size_kg=request.batch_size_kg,
-        packaging_type=request.packaging_type,
-        manufacturer=request.manufacturer,
-        excipients=request.excipients or {},
-        notes=request.notes,
-        status=BatchStatus.PENDING,
-    )
-    db.add(batch)
-    await db.flush()
-    await db.refresh(batch)
-    return _to_response(batch)
+    db = get_db()
+    batch_doc = {
+        "batch_id": _generate_batch_id(),
+        "owner_id": ObjectId(current_user.id),
+        "drug_name": request.drug_name,
+        "dosage_form": request.dosage_form,
+        "strength_mg": request.strength_mg,
+        "drug_load_percent": request.drug_load_percent,
+        "batch_size_kg": request.batch_size_kg,
+        "packaging_type": request.packaging_type,
+        "manufacturer": request.manufacturer,
+        "excipients": request.excipients or {},
+        "notes": request.notes,
+        "status": BatchStatus.PENDING,
+        "created_at": datetime.utcnow(),
+    }
+    result = await db.batches.insert_one(batch_doc)
+    batch_doc["_id"] = result.inserted_id
+    return _to_response(batch_doc)
 
 
 @router.get("/", response_model=List[BatchResponse])
@@ -85,40 +101,34 @@ async def list_batches(
     limit: int = 20,
     search: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    query = select(Batch).where(Batch.owner_id == current_user.id)
+    db = get_db()
+    query = {"owner_id": ObjectId(current_user.id)}
 
     if search:
-        query = query.where(
-            or_(
-                Batch.drug_name.ilike(f"%{search}%"),
-                Batch.batch_id.ilike(f"%{search}%"),
-            )
-        )
+        query["$or"] = [
+            {"drug_name": {"$regex": search, "$options": "i"}},
+            {"batch_id": {"$regex": search, "$options": "i"}},
+        ]
     if status:
-        query = query.where(Batch.status == status)
+        query["status"] = status
 
-    query = query.order_by(desc(Batch.created_at)).offset(skip).limit(limit)
-    result = await db.execute(query)
-    batches = result.scalars().all()
+    cursor = db.batches.find(query).sort("created_at", -1).skip(skip).limit(limit)
+    batches = await cursor.to_list(length=limit)
     return [_to_response(b) for b in batches]
 
 
 @router.get("/{batch_id}", response_model=BatchResponse)
 async def get_batch(
     batch_id: str,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Batch).where(
-            Batch.id == uuid.UUID(batch_id),
-            Batch.owner_id == current_user.id,
-        )
-    )
-    batch = result.scalar_one_or_none()
+    db = get_db()
+    batch = await db.batches.find_one({
+        "_id": ObjectId(batch_id),
+        "owner_id": ObjectId(current_user.id),
+    })
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     return _to_response(batch)
@@ -128,60 +138,27 @@ async def get_batch(
 async def update_batch_status(
     batch_id: str,
     status: str,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Batch).where(
-            Batch.id == uuid.UUID(batch_id),
-            Batch.owner_id == current_user.id,
-        )
+    db = get_db()
+    result = await db.batches.update_one(
+        {"_id": ObjectId(batch_id), "owner_id": ObjectId(current_user.id)},
+        {"$set": {"status": status, "updated_at": datetime.utcnow()}}
     )
-    batch = result.scalar_one_or_none()
-    if not batch:
+    if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Batch not found")
-
-    try:
-        batch.status = BatchStatus(status)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid status: {status}")
-
     return {"message": "Status updated", "batch_id": batch_id, "status": status}
 
 
 @router.delete("/{batch_id}", status_code=204)
 async def delete_batch(
     batch_id: str,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    result = await db.execute(
-        select(Batch).where(
-            Batch.id == uuid.UUID(batch_id),
-            Batch.owner_id == current_user.id,
-        )
-    )
-    batch = result.scalar_one_or_none()
-    if not batch:
+    db = get_db()
+    result = await db.batches.delete_one({
+        "_id": ObjectId(batch_id),
+        "owner_id": ObjectId(current_user.id),
+    })
+    if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Batch not found")
-    await db.delete(batch)
-
-
-def _to_response(b: Batch) -> BatchResponse:
-    return BatchResponse(
-        id=str(b.id),
-        batch_id=b.batch_id,
-        drug_name=b.drug_name,
-        dosage_form=b.dosage_form,
-        strength_mg=b.strength_mg,
-        drug_load_percent=b.drug_load_percent,
-        batch_size_kg=b.batch_size_kg,
-        packaging_type=b.packaging_type,
-        manufacturer=b.manufacturer,
-        status=b.status.value if b.status else "pending",
-        stability_score=b.stability_score,
-        degradation_risk=b.degradation_risk,
-        predicted_shelf_life_months=b.predicted_shelf_life_months,
-        notes=b.notes,
-        created_at=b.created_at or datetime.utcnow(),
-    )

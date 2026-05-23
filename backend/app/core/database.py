@@ -1,48 +1,35 @@
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase
+from motor.motor_asyncio import AsyncIOMotorClient
 from app.core.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
 
-is_sqlite = settings.DATABASE_URL.startswith("sqlite")
-
-engine_kwargs = {
-    "echo": settings.DEBUG,
-}
-
-if not is_sqlite:
-    engine_kwargs.update({
-        "pool_pre_ping": True,
-        "pool_size": 10,
-        "max_overflow": 20,
-    })
-
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    **engine_kwargs
-)
-
-AsyncSessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autocommit=False,
-    autoflush=False,
-)
+client: AsyncIOMotorClient = None
+db = None
 
 
-class Base(DeclarativeBase):
-    pass
+async def connect_db():
+    """Connect to MongoDB."""
+    global client, db
+    try:
+        client = AsyncIOMotorClient(settings.MONGODB_URL)
+        db = client[settings.MONGODB_DB_NAME]
+        # Test connection
+        await client.admin.command("ping")
+        logger.info(f"✅ Connected to MongoDB: {settings.MONGODB_DB_NAME}")
+    except Exception as e:
+        logger.error(f"❌ MongoDB connection failed: {e}")
+        raise
 
 
-async def get_db() -> AsyncSession:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+async def close_db():
+    """Close MongoDB connection."""
+    global client
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
+
+
+def get_db():
+    """Get database instance."""
+    return db

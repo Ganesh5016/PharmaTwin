@@ -1,34 +1,58 @@
-"""Dashboard API"""
+"""Dashboard API - MongoDB version"""
 from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from bson import ObjectId
 from app.api.v1.auth import get_current_user
-from app.models.models import User, Batch, Prediction, BatchStatus
+from app.models.models import User, BatchStatus
 from app.core.database import get_db
 
 router = APIRouter()
 
+
 @router.get("/summary")
 async def get_dashboard_summary(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
 ):
-    # Query overall stats
-    total_batches = await db.scalar(select(func.count(Batch.id)).where(Batch.owner_id == current_user.id)) or 0
-    active_batches = await db.scalar(select(func.count(Batch.id)).where(Batch.owner_id == current_user.id, Batch.status == BatchStatus.ACTIVE)) or 0
-    
-    # Get averages from predictions
-    avg_stability = await db.scalar(select(func.avg(Prediction.stability_score)).where(Prediction.user_id == current_user.id)) or 0.0
-    avg_shelf_life = await db.scalar(select(func.avg(Prediction.shelf_life_months)).where(Prediction.user_id == current_user.id)) or 0.0
-    avg_degradation = await db.scalar(select(func.avg(Prediction.degradation_risk)).where(Prediction.user_id == current_user.id)) or 0.0
-    
-    # Recent batches
-    recent_batches_result = await db.execute(
-        select(Batch).where(Batch.owner_id == current_user.id).order_by(Batch.created_at.desc()).limit(4)
-    )
-    recent_batches = recent_batches_result.scalars().all()
+    db = get_db()
+    user_oid = ObjectId(current_user.id)
 
-    # Generate insights based on actual data
+    # Count batches
+    total_batches = await db.batches.count_documents({"owner_id": user_oid})
+    active_batches = await db.batches.count_documents({"owner_id": user_oid, "status": BatchStatus.ACTIVE})
+
+    # Get prediction averages via aggregation
+    pipeline = [
+        {"$match": {"user_id": user_oid}},
+        {"$group": {
+            "_id": None,
+            "avg_stability": {"$avg": "$stability_score"},
+            "avg_shelf_life": {"$avg": "$shelf_life_months"},
+            "avg_degradation": {"$avg": "$degradation_risk"},
+            "count": {"$sum": 1},
+        }}
+    ]
+    agg_result = await db.predictions.aggregate(pipeline).to_list(1)
+    stats = agg_result[0] if agg_result else {}
+
+    avg_stability = stats.get("avg_stability", 0.0) or 0.0
+    avg_shelf_life = stats.get("avg_shelf_life", 0.0) or 0.0
+    avg_degradation = stats.get("avg_degradation", 0.0) or 0.0
+
+    # Recent batches
+    recent_batches = await db.batches.find(
+        {"owner_id": user_oid}
+    ).sort("created_at", -1).limit(4).to_list(4)
+
+    # Latest prediction timeline
+    latest_pred = await db.predictions.find_one(
+        {"user_id": user_oid},
+        sort=[("created_at", -1)]
+    )
+
+    timeline = latest_pred.get("stability_timeline", [1.0] * 25) if latest_pred else [1.0] * 25
+    upper = latest_pred.get("stability_upper_ci", [1.0] * 25) if latest_pred else [1.0] * 25
+    lower = latest_pred.get("stability_lower_ci", [1.0] * 25) if latest_pred else [1.0] * 25
+
+    # Generate insights
     insights = []
     if total_batches == 0:
         insights.append({
@@ -42,16 +66,6 @@ async def get_dashboard_summary(
             "description": "Your recent batches are showing concerning stability trends.",
             "severity": "warning"
         })
-
-    # Timeline calculation (fetch most recent prediction timeline if available)
-    latest_pred_result = await db.execute(
-        select(Prediction).where(Prediction.user_id == current_user.id).order_by(Prediction.created_at.desc()).limit(1)
-    )
-    latest_pred = latest_pred_result.scalar_one_or_none()
-
-    timeline = latest_pred.stability_timeline if latest_pred and latest_pred.stability_timeline else [1.0] * 25
-    upper = latest_pred.stability_upper_ci if latest_pred and latest_pred.stability_upper_ci else [1.0] * 25
-    lower = latest_pred.stability_lower_ci if latest_pred and latest_pred.stability_lower_ci else [1.0] * 25
 
     return {
         "stability_score": avg_stability,
@@ -71,21 +85,22 @@ async def get_dashboard_summary(
         "ai_insights": insights,
         "recent_batches": [
             {
-                "batchId": b.batch_id,
-                "formulation": b.drug_name,
-                "stabilityScore": b.stability_score or 0.0,
-                "riskScore": b.degradation_risk or 0.0,
-                "status": b.status.value
+                "batchId": b.get("batch_id", ""),
+                "formulation": b.get("drug_name", ""),
+                "stabilityScore": b.get("stability_score", 0.0) or 0.0,
+                "riskScore": b.get("degradation_risk", 0.0) or 0.0,
+                "status": b.get("status", "pending"),
             } for b in recent_batches
         ]
     }
 
+
 @router.get("/analytics")
 async def get_analytics(
     current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
 ):
-    total_preds = await db.scalar(select(func.count(Prediction.id)).where(Prediction.user_id == current_user.id)) or 0
+    db = get_db()
+    total_preds = await db.predictions.count_documents({"user_id": ObjectId(current_user.id)})
     return {
         "predictions_this_month": total_preds,
         "avg_stability_score": 0.82,

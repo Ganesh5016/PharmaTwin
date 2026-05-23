@@ -1,14 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
-import uuid
+from bson import ObjectId
 import logging
 
 from app.core.database import get_db
-from app.models.models import Prediction, User
+from app.models.models import User
 from app.api.v1.auth import get_current_user
 from ml.inference.predictor import PharmaTwinPredictor
 
@@ -65,9 +63,6 @@ class PredictionListItem(BaseModel):
     confidence: float
     created_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 # ─── Endpoints ──────────────────────────────────────────────────────────────
 
@@ -75,7 +70,6 @@ class PredictionListItem(BaseModel):
 async def run_prediction(
     request: PredictionRequest,
     background_tasks: BackgroundTasks,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Run AI prediction ensemble for pharmaceutical stability."""
@@ -93,36 +87,37 @@ async def run_prediction(
             ich_zone=request.ich_zone or "II",
         )
 
-        # Save to DB
-        pred = Prediction(
-            batch_id=uuid.UUID(request.batch_id) if request.batch_id else None,
-            user_id=current_user.id,
-            input_params=request.model_dump(),
-            model_type="ensemble",
-            shelf_life_months=result["shelf_life_months"],
-            shelf_life_lower=result["shelf_life_lower"],
-            shelf_life_upper=result["shelf_life_upper"],
-            confidence=result["confidence"],
-            stability_score=result["stability_score"],
-            stability_timeline=result["stability_timeline"],
-            stability_upper_ci=result["stability_upper_ci"],
-            stability_lower_ci=result["stability_lower_ci"],
-            degradation_risk=result["degradation_risk"],
-            dissolution_profile=result["dissolution_profile"],
-            failure_probability=result["failure_probability"],
-            feature_importance=result["feature_importance"],
-            explanation=result["explanation"],
-            is_anomaly=result["is_anomaly"],
-            anomaly_score=result["anomaly_score"],
-            status="completed",
-        )
-        db.add(pred)
-        await db.flush()
+        # Save to MongoDB
+        db = get_db()
+        pred_doc = {
+            "user_id": ObjectId(current_user.id),
+            "batch_id": request.batch_id,
+            "input_params": request.model_dump(),
+            "model_type": "ensemble",
+            "shelf_life_months": result["shelf_life_months"],
+            "shelf_life_lower": result["shelf_life_lower"],
+            "shelf_life_upper": result["shelf_life_upper"],
+            "confidence": result["confidence"],
+            "stability_score": result["stability_score"],
+            "stability_timeline": result["stability_timeline"],
+            "stability_upper_ci": result["stability_upper_ci"],
+            "stability_lower_ci": result["stability_lower_ci"],
+            "degradation_risk": result["degradation_risk"],
+            "dissolution_profile": result["dissolution_profile"],
+            "failure_probability": result["failure_probability"],
+            "feature_importance": result["feature_importance"],
+            "explanation": result["explanation"],
+            "is_anomaly": result["is_anomaly"],
+            "anomaly_score": result["anomaly_score"],
+            "status": "completed",
+            "created_at": datetime.utcnow(),
+        }
+        insert_result = await db.predictions.insert_one(pred_doc)
 
         return PredictionResponse(
-            prediction_id=str(pred.id),
+            prediction_id=str(insert_result.inserted_id),
             **result,
-            created_at=pred.created_at or datetime.utcnow(),
+            created_at=pred_doc["created_at"],
         )
 
     except Exception as e:
@@ -134,28 +129,25 @@ async def run_prediction(
 async def list_predictions(
     skip: int = 0,
     limit: int = 20,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """List user's predictions."""
-    result = await db.execute(
-        select(Prediction)
-        .where(Prediction.user_id == current_user.id)
-        .order_by(desc(Prediction.created_at))
-        .offset(skip)
-        .limit(limit)
-    )
-    predictions = result.scalars().all()
+    db = get_db()
+    cursor = db.predictions.find(
+        {"user_id": ObjectId(current_user.id)}
+    ).sort("created_at", -1).skip(skip).limit(limit)
+
+    predictions = await cursor.to_list(length=limit)
 
     return [
         PredictionListItem(
-            id=str(p.id),
-            drug_name=p.input_params.get("drug_name", "Unknown"),
-            shelf_life_months=p.shelf_life_months or 0,
-            stability_score=p.stability_score or 0,
-            degradation_risk=p.degradation_risk or 0,
-            confidence=p.confidence or 0,
-            created_at=p.created_at,
+            id=str(p["_id"]),
+            drug_name=p.get("input_params", {}).get("drug_name", "Unknown"),
+            shelf_life_months=p.get("shelf_life_months", 0),
+            stability_score=p.get("stability_score", 0),
+            degradation_risk=p.get("degradation_risk", 0),
+            confidence=p.get("confidence", 0),
+            created_at=p.get("created_at", datetime.utcnow()),
         )
         for p in predictions
     ]
@@ -164,37 +156,34 @@ async def list_predictions(
 @router.get("/{prediction_id}", response_model=PredictionResponse)
 async def get_prediction(
     prediction_id: str,
-    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Get prediction by ID."""
-    result = await db.execute(
-        select(Prediction).where(
-            Prediction.id == uuid.UUID(prediction_id),
-            Prediction.user_id == current_user.id,
-        )
-    )
-    pred = result.scalar_one_or_none()
+    db = get_db()
+    pred = await db.predictions.find_one({
+        "_id": ObjectId(prediction_id),
+        "user_id": ObjectId(current_user.id),
+    })
     if not pred:
         raise HTTPException(status_code=404, detail="Prediction not found")
 
     return PredictionResponse(
-        prediction_id=str(pred.id),
-        shelf_life_months=pred.shelf_life_months,
-        shelf_life_lower=pred.shelf_life_lower,
-        shelf_life_upper=pred.shelf_life_upper,
-        confidence=pred.confidence,
-        stability_score=pred.stability_score,
-        stability_timeline=pred.stability_timeline or [],
-        stability_upper_ci=pred.stability_upper_ci or [],
-        stability_lower_ci=pred.stability_lower_ci or [],
-        degradation_risk=pred.degradation_risk,
-        dissolution_profile=pred.dissolution_profile or [],
-        failure_probability=pred.failure_probability,
-        feature_importance=pred.feature_importance or {},
-        explanation=pred.explanation or "",
-        is_anomaly=pred.is_anomaly,
-        anomaly_score=pred.anomaly_score or 0,
+        prediction_id=str(pred["_id"]),
+        shelf_life_months=pred["shelf_life_months"],
+        shelf_life_lower=pred["shelf_life_lower"],
+        shelf_life_upper=pred["shelf_life_upper"],
+        confidence=pred["confidence"],
+        stability_score=pred["stability_score"],
+        stability_timeline=pred.get("stability_timeline", []),
+        stability_upper_ci=pred.get("stability_upper_ci", []),
+        stability_lower_ci=pred.get("stability_lower_ci", []),
+        degradation_risk=pred["degradation_risk"],
+        dissolution_profile=pred.get("dissolution_profile", []),
+        failure_probability=pred["failure_probability"],
+        feature_importance=pred.get("feature_importance", {}),
+        explanation=pred.get("explanation", ""),
+        is_anomaly=pred.get("is_anomaly", False),
+        anomaly_score=pred.get("anomaly_score", 0),
         model_contributions={},
-        created_at=pred.created_at,
+        created_at=pred.get("created_at", datetime.utcnow()),
     )
