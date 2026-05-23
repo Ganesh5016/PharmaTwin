@@ -91,7 +91,11 @@ async def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid token")
 
     db = get_db()
-    doc = await db.users.find_one({"_id": ObjectId(user_id)})
+    try:
+        doc = await db.users.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=401, detail="Please log out and log in again.")
+
     if not doc or not doc.get("is_active", True):
         raise HTTPException(status_code=401, detail="User not found or inactive")
 
